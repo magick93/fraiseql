@@ -131,6 +131,11 @@ pub enum DiagnosticLevel {
 // ---------------------------------------------------------------------------
 
 impl RestRouteTable {
+    /// Look up a resource by its GraphQL type name.
+    pub fn find_resource_by_type(&self, type_name: &str) -> Option<&RestResource> {
+        self.resources.iter().find(|r| r.type_name == type_name)
+    }
+
     /// Derive a route table from a compiled schema.
     ///
     /// Returns `Err` if route conflicts are detected that cannot be resolved.
@@ -1405,6 +1410,41 @@ mod tests {
         let table = RestRouteTable::from_compiled_schema(&schema).unwrap();
         assert_eq!(table.base_path, "/rest/v1");
         assert_eq!(table.resources.len(), 1);
+    }
+
+    #[test]
+    fn find_resource_by_type_returns_matching_resource() {
+        let table = RestRouteTable {
+            base_path: "/rest/v1".to_string(),
+            resources: vec![
+                RestResource {
+                    name: "users".to_string(),
+                    type_name: "User".to_string(),
+                    id_arg: Some("id".to_string()),
+                    routes: vec![],
+                },
+                RestResource {
+                    name: "posts".to_string(),
+                    type_name: "Post".to_string(),
+                    id_arg: Some("id".to_string()),
+                    routes: vec![],
+                },
+            ],
+            diagnostics: vec![],
+        };
+        let found = table.find_resource_by_type("Post");
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().name, "posts");
+    }
+
+    #[test]
+    fn find_resource_by_type_returns_none_for_unknown() {
+        let table = RestRouteTable {
+            base_path: "/rest/v1".to_string(),
+            resources: vec![],
+            diagnostics: vec![],
+        };
+        assert!(table.find_resource_by_type("Unknown").is_none());
     }
 
     #[test]

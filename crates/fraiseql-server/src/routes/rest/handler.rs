@@ -649,6 +649,33 @@ impl<'a, A: DatabaseAdapter> RestHandler<'a, A> {
             }
         }
 
+        // Inject HAL-style _links for single-resource (get-by-id) responses.
+        if matches!(params.pagination, PaginationParams::None) {
+            if let Some(data) = body.get("data") {
+                if let Some(id_val) = data.get("id").and_then(|v| v.as_str()) {
+                    let type_name = &query_match.query_def.return_type;
+                    let relationships = self
+                        .schema
+                        .find_type(type_name)
+                        .map(|td| td.relationships.as_slice())
+                        .unwrap_or(&[]);
+
+                    if let Some(resource) =
+                        self.route_table.find_resource_by_type(type_name)
+                    {
+                        let resource_path = format!("/{}", resource.name);
+                        let link_builder = super::links::HalLinkBuilder::new(
+                            &self.route_table.base_path,
+                            self.route_table,
+                        );
+                        let links =
+                            link_builder.build(&resource_path, id_val, relationships);
+                        body["_links"] = links;
+                    }
+                }
+            }
+        }
+
         Ok(RestResponse {
             status:  StatusCode::OK,
             headers: response_headers,

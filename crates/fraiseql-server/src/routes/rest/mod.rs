@@ -12,6 +12,7 @@ pub mod cache_control;
 pub mod embedding;
 pub mod handler;
 pub mod idempotency;
+pub mod links;
 pub mod openapi;
 pub mod params;
 pub mod resource;
