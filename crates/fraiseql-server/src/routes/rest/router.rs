@@ -18,6 +18,8 @@ use fraiseql_core::{
     db::traits::DatabaseAdapter,
     runtime::Executor,
 };
+use std::collections::HashMap;
+
 use serde_json::json;
 use tower_http::compression::{CompressionLayer, predicate::SizeAbove};
 use tracing::info;
@@ -144,22 +146,8 @@ where
         router = router.layer(CompressionLayer::new().compress_when(SizeAbove::new(1024)));
     }
 
-    // Serve OpenAPI specification at {base_path}/openapi.json.
-    let openapi_path = format!("{}/openapi.json", base_path.trim_end_matches('/'));
-    let openapi_spec = match super::openapi::generate_openapi(schema, &route_table) {
-        Ok(spec) => Arc::new(spec),
-        Err(e) => {
-            tracing::warn!(error = %e, "OpenAPI spec generation failed");
-            Arc::new(json!({"error": "OpenAPI generation failed"}))
-        },
-    };
-    router = router.route(
-        &openapi_path,
-        get(move || {
-            let spec = openapi_spec.clone();
-            async move { axum::Json((*spec).clone()) }
-        }),
-    );
+    // Serve OpenAPI specs: full, per-domain, and API catalog.
+    router = mount_openapi_routes(router, schema, &route_table, &base_path);
 
     // Log startup summary.
     let resource_count = route_table.resources.len();
@@ -272,22 +260,8 @@ where
         router = router.layer(CompressionLayer::new().compress_when(SizeAbove::new(1024)));
     }
 
-    // Serve OpenAPI specification at {base_path}/openapi.json.
-    let openapi_path = format!("{}/openapi.json", base_path.trim_end_matches('/'));
-    let openapi_spec = match super::openapi::generate_openapi(schema, &route_table) {
-        Ok(spec) => Arc::new(spec),
-        Err(e) => {
-            tracing::warn!(error = %e, "OpenAPI spec generation failed");
-            Arc::new(json!({"error": "OpenAPI generation failed"}))
-        },
-    };
-    router = router.route(
-        &openapi_path,
-        get(move || {
-            let spec = openapi_spec.clone();
-            async move { axum::Json((*spec).clone()) }
-        }),
-    );
+    // Serve OpenAPI specs: full, per-domain, and API catalog.
+    router = mount_openapi_routes(router, schema, &route_table, &base_path);
 
     // Log startup summary.
     let resource_count = route_table.resources.len();
@@ -998,4 +972,93 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0], ("name[icontains]".to_string(), "alice".to_string()));
     }
+}
+
+// ---------------------------------------------------------------------------
+// OpenAPI route mounting helper
+// ---------------------------------------------------------------------------
+
+/// Mount OpenAPI spec routes on a router: full spec, per-domain specs, and API catalog.
+fn mount_openapi_routes(
+    mut router: Router,
+    schema: &fraiseql_core::schema::CompiledSchema,
+    route_table: &RestRouteTable,
+    base_path: &str,
+) -> Router {
+    use axum::response::IntoResponse;
+
+    let bp = base_path.trim_end_matches('/');
+
+    let full_spec = match super::openapi::generate_openapi(schema, route_table) {
+        Ok(spec) => Arc::new(spec),
+        Err(e) => {
+            tracing::warn!(error = %e, "OpenAPI spec generation failed");
+            Arc::new(json!({"error": "OpenAPI generation failed"}))
+        }
+    };
+
+    // Per-domain specs and catalog.
+    let domain_specs = super::openapi::split_openapi_by_domain(&full_spec);
+    let domain_count = domain_specs.len();
+    let catalog = Arc::new(super::openapi::build_api_catalog(bp, &domain_specs));
+    let domain_specs: HashMap<String, Arc<serde_json::Value>> = domain_specs
+        .into_iter()
+        .map(|(k, v)| (k, Arc::new(v)))
+        .collect();
+    let domain_specs = Arc::new(domain_specs);
+
+    // Full spec: {base_path}/openapi.json
+    let full = full_spec.clone();
+    router = router.route(
+        &format!("{bp}/openapi.json"),
+        get(move || {
+            let spec = full.clone();
+            async move { axum::Json((*spec).clone()) }
+        }),
+    );
+
+    // Per-domain: {base_path}/openapi/{domain}.json
+    let ds = domain_specs.clone();
+    router = router.route(
+        &format!("{bp}/openapi/:domain"),
+        get(
+            move |axum::extract::Path(domain): axum::extract::Path<String>| {
+                let specs = ds.clone();
+                async move {
+                    let key = domain.trim_end_matches(".json");
+                    match specs.get(key) {
+                        Some(spec) => axum::Json((**spec).clone()).into_response(),
+                        None => {
+                            let mut domains: Vec<&String> = specs.keys().collect();
+                            domains.sort();
+                            (
+                                StatusCode::NOT_FOUND,
+                                axum::Json(json!({
+                                    "error": format!("Unknown domain: {key}"),
+                                    "available": domains,
+                                })),
+                            )
+                                .into_response()
+                        }
+                    }
+                }
+            },
+        ),
+    );
+
+    // Catalog: {base_path}/api-catalog.json
+    router = router.route(
+        &format!("{bp}/api-catalog.json"),
+        get(move || {
+            let cat = catalog.clone();
+            async move { axum::Json((*cat).clone()) }
+        }),
+    );
+
+    info!(
+        domains = domain_count,
+        "Per-domain OpenAPI specs at {bp}/openapi/{{domain}}.json"
+    );
+
+    router
 }
