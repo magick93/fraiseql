@@ -8,7 +8,7 @@ use std::{collections::HashMap, sync::Arc};
 
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use fraiseql_core::{
-    db::traits::{DatabaseAdapter, SupportsMutations},
+    db::traits::DatabaseAdapter,
     runtime::{Executor, QueryMatch},
     schema::{CompiledSchema, DeleteResponse, RestConfig, TypeDefinition},
     security::SecurityContext,
@@ -425,9 +425,15 @@ impl<'a, A: DatabaseAdapter> RestHandler<'a, A> {
 
         let params = extractor.extract(&path_pairs, query_pairs)?;
 
-        // Build field names from RestFieldSpec
+        // Build field names from RestFieldSpec.
+        // When no explicit `?select=` is provided, expand to all type fields so
+        // the projector extracts them from the JSONB `data` column.
         let field_names = match &params.field_selection {
-            RestFieldSpec::All => Vec::new(),
+            RestFieldSpec::All => {
+                type_def
+                    .map(|td| td.fields.iter().map(|f| f.name.to_string()).collect())
+                    .unwrap_or_default()
+            },
             RestFieldSpec::Fields(fields) => fields.clone(),
         };
 
@@ -643,6 +649,33 @@ impl<'a, A: DatabaseAdapter> RestHandler<'a, A> {
             }
         }
 
+        // Inject HAL-style _links for single-resource (get-by-id) responses.
+        if matches!(params.pagination, PaginationParams::None) {
+            if let Some(data) = body.get("data") {
+                if let Some(id_val) = data.get("id").and_then(|v| v.as_str()) {
+                    let type_name = &query_match.query_def.return_type;
+                    let relationships = self
+                        .schema
+                        .find_type(type_name)
+                        .map(|td| td.relationships.as_slice())
+                        .unwrap_or(&[]);
+
+                    if let Some(resource) =
+                        self.route_table.find_resource_by_type(type_name)
+                    {
+                        let resource_path = format!("/{}", resource.name);
+                        let link_builder = super::links::HalLinkBuilder::new(
+                            &self.route_table.base_path,
+                            self.route_table,
+                        );
+                        let links =
+                            link_builder.build(&resource_path, id_val, relationships);
+                        body["_links"] = links;
+                    }
+                }
+            }
+        }
+
         Ok(RestResponse {
             status:  StatusCode::OK,
             headers: response_headers,
@@ -651,7 +684,7 @@ impl<'a, A: DatabaseAdapter> RestHandler<'a, A> {
     }
 }
 
-impl<A: DatabaseAdapter + SupportsMutations> RestHandler<'_, A> {
+impl<A: DatabaseAdapter> RestHandler<'_, A> {
     /// Handle a POST request (create mutation, bulk insert, or custom action).
     ///
     /// Array body on a collection route triggers bulk insert mode.
@@ -1234,23 +1267,19 @@ fn stored_response_to_rest(stored: StoredResponse, request_headers: &HeaderMap) 
 }
 
 /// Execute a mutation, routing through security context when available.
-async fn execute_mutation<A: DatabaseAdapter + SupportsMutations>(
+async fn execute_mutation<A: DatabaseAdapter>(
     executor: &Executor<A>,
     mutation_name: &str,
     variables: Option<&serde_json::Value>,
     security_context: Option<&SecurityContext>,
 ) -> Result<serde_json::Value, RestError> {
-    let result = if let Some(ctx) = security_context {
-        executor
-            .execute_mutation_with_security(
-                mutation_name,
-                variables.unwrap_or(&serde_json::json!({})),
-                Some(ctx),
-            )
-            .await
-    } else {
-        executor.execute_mutation(mutation_name, variables, &HashMap::new()).await
-    };
+    let result = executor
+        .execute_mutation_with_security(
+            mutation_name,
+            variables.unwrap_or(&serde_json::json!({})),
+            security_context,
+        )
+        .await;
     result.map_err(RestError::from)
 }
 

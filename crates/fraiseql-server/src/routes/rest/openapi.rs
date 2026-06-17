@@ -11,6 +11,8 @@
 //! - Bracket operator documentation in filter parameters
 //! - `Prefer` header documentation on collection/delete endpoints
 
+use std::collections::HashMap;
+
 use fraiseql_core::schema::{
     Cardinality, CompiledSchema, DeleteResponse, FieldType, MutationDefinition, MutationOperation,
     QueryDefinition, RestConfig, TypeDefinition,
@@ -40,6 +42,91 @@ pub fn generate_openapi(
 
     let generator = OpenApiGenerator::new(schema, route_table, config);
     Ok(generator.generate())
+}
+
+/// Split a full OpenAPI spec into per-domain specs keyed by domain prefix.
+///
+/// Paths are partitioned by their first segment (e.g. `/recruiting/...` → `"recruiting"`).
+/// Each domain spec gets its own filtered paths and a domain-specific title.
+/// Paths with no domain prefix (like `/openapi.json`) go into a `"meta"` domain.
+pub fn split_openapi_by_domain(full_spec: &Value) -> HashMap<String, Value> {
+    let paths = match full_spec.get("paths").and_then(|p| p.as_object()) {
+        Some(p) => p,
+        None => return HashMap::new(),
+    };
+
+    // Partition paths by first segment.
+    let mut domain_paths: HashMap<String, Map<String, Value>> = HashMap::new();
+    for (path, ops) in paths {
+        let domain = path
+            .trim_start_matches('/')
+            .split('/')
+            .next()
+            .unwrap_or("meta")
+            .to_string();
+        domain_paths
+            .entry(domain)
+            .or_default()
+            .insert(path.clone(), ops.clone());
+    }
+
+    // Build per-domain specs.
+    let mut result = HashMap::new();
+    for (domain, filtered_paths) in &domain_paths {
+        let path_count = filtered_paths.len();
+        let mut spec = full_spec.clone();
+        spec["paths"] = Value::Object(filtered_paths.clone());
+        spec["info"]["title"] = json!(format!(
+            "FraiseQL REST API — {}",
+            capitalize(domain)
+        ));
+        spec["info"]["description"] = json!(format!(
+            "{} domain ({} paths)",
+            capitalize(domain),
+            path_count
+        ));
+        result.insert(domain.clone(), spec);
+    }
+
+    result
+}
+
+/// Build an API catalog listing available domain specs.
+pub fn build_api_catalog(
+    base_path: &str,
+    domain_specs: &HashMap<String, Value>,
+) -> Value {
+    let mut domains: Vec<Value> = domain_specs
+        .iter()
+        .map(|(domain, spec)| {
+            let path_count = spec
+                .get("paths")
+                .and_then(|p| p.as_object())
+                .map_or(0, |p| p.len());
+            json!({
+                "name": domain,
+                "title": spec["info"]["title"],
+                "url": format!("{}/openapi/{}.json", base_path.trim_end_matches('/'), domain),
+                "paths": path_count,
+            })
+        })
+        .collect();
+    domains.sort_by(|a, b| a["name"].as_str().cmp(&b["name"].as_str()));
+
+    json!({
+        "api_version": "1.0.0",
+        "total_domains": domains.len(),
+        "all_spec_url": format!("{}/openapi.json", base_path.trim_end_matches('/')),
+        "domains": domains,
+    })
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        None => String::new(),
+        Some(f) => f.to_uppercase().to_string() + c.as_str(),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1197,14 +1284,6 @@ fn should_have_prefer_header(route: &RestRoute) -> bool {
     }
 }
 
-fn capitalize(s: &str) -> String {
-    let mut chars = s.chars();
-    match chars.next() {
-        None => String::new(),
-        Some(c) => c.to_uppercase().to_string() + chars.as_str(),
-    }
-}
-
 fn to_snake(s: &str) -> String {
     let mut result = String::new();
     for (i, c) in s.chars().enumerate() {
@@ -1831,5 +1910,70 @@ mod tests {
         let params = spec["paths"]["/counters"]["get"]["parameters"].as_array().unwrap();
         let search_param = params.iter().find(|p| p["name"] == "search");
         assert!(search_param.is_none(), "Non-FTS resource should not have search param");
+    }
+
+    // -- Domain split tests --------------------------------------------------
+
+    #[test]
+    fn split_partitions_by_first_path_segment() {
+        let spec = json!({
+            "openapi": "3.0.3",
+            "info": {"title": "Test", "version": "1.0.0"},
+            "paths": {
+                "/recruiting/candidates": {"get": {}},
+                "/recruiting/jobs": {"get": {}},
+                "/common/persons": {"get": {}},
+                "/openapi.json": {"get": {}},
+            },
+        });
+        let domains = split_openapi_by_domain(&spec);
+        assert_eq!(domains.len(), 3);
+        assert_eq!(
+            domains["recruiting"]["paths"].as_object().unwrap().len(),
+            2
+        );
+        assert_eq!(domains["common"]["paths"].as_object().unwrap().len(), 1);
+        assert_eq!(
+            domains["openapi.json"]["paths"].as_object().unwrap().len(),
+            1
+        );
+    }
+
+    #[test]
+    fn split_sets_domain_title() {
+        let spec = json!({
+            "openapi": "3.0.3",
+            "info": {"title": "Test", "version": "1.0.0"},
+            "paths": {
+                "/recruiting/candidates": {"get": {}},
+            },
+        });
+        let domains = split_openapi_by_domain(&spec);
+        assert!(domains["recruiting"]["info"]["title"]
+            .as_str()
+            .unwrap()
+            .contains("Recruiting"));
+    }
+
+    #[test]
+    fn catalog_lists_all_domains() {
+        let spec = json!({
+            "openapi": "3.0.3",
+            "info": {"title": "Test", "version": "1.0.0"},
+            "paths": {
+                "/recruiting/candidates": {"get": {}},
+                "/common/persons": {"get": {}},
+            },
+        });
+        let domains = split_openapi_by_domain(&spec);
+        let catalog = build_api_catalog("/rest/v1", &domains);
+        assert_eq!(catalog["total_domains"], 2);
+        let domain_list = catalog["domains"].as_array().unwrap();
+        assert_eq!(domain_list[0]["name"], "common");
+        assert_eq!(domain_list[1]["name"], "recruiting");
+        assert!(domain_list[1]["url"]
+            .as_str()
+            .unwrap()
+            .contains("/openapi/recruiting.json"));
     }
 }

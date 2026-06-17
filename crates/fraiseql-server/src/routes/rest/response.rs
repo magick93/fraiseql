@@ -77,6 +77,50 @@ impl<'a> RestResponseFormatter<'a> {
         })
     }
 
+    /// Format a single-resource GET response with HAL-style `_links`.
+    ///
+    /// Same as `format_single()` but adds `_links` to the response envelope.
+    ///
+    /// # Errors
+    ///
+    /// Returns `RestError` if the execution result cannot be parsed as JSON.
+    pub fn format_single_with_links(
+        &self,
+        result: &serde_json::Value,
+        request_headers: &HeaderMap,
+        links: serde_json::Value,
+    ) -> Result<RestResponse, RestError> {
+        let data = extract_single_data(result)?;
+        let body = json!({
+            "data": data,
+            "_links": links,
+        });
+        let body_bytes = serde_json::to_vec(&body)
+            .map_err(|e| RestError::internal(format!("Failed to serialize response: {e}")))?;
+
+        let mut headers = HeaderMap::new();
+        set_request_id(request_headers, &mut headers);
+
+        if self.config.etag {
+            let etag = compute_etag(&body_bytes);
+            if check_if_none_match(request_headers, &etag) == Some(true) {
+                headers.insert("etag", header_value(&etag));
+                return Ok(RestResponse {
+                    status: StatusCode::NOT_MODIFIED,
+                    headers,
+                    body: None,
+                });
+            }
+            headers.insert("etag", header_value(&etag));
+        }
+
+        Ok(RestResponse {
+            status: StatusCode::OK,
+            headers,
+            body: Some(body),
+        })
+    }
+
     /// Format a collection GET response with pagination metadata and links.
     ///
     /// Uses `PaginationParams` to decide link style (offset vs cursor).
@@ -1467,5 +1511,61 @@ mod tests {
             format_id_for_url(&json!("550e8400-e29b-41d4-a716-446655440000")),
             "550e8400-e29b-41d4-a716-446655440000"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // format_single_with_links
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn format_single_with_links_includes_links() {
+        let config = no_etag_config();
+        let fmt = RestResponseFormatter::new(&config, "/rest/v1");
+        let result = v(r#"{"data":{"id":"abc-123","name":"Test"}}"#);
+        let links = json!({
+            "self": {"href": "/rest/v1/candidates/abc-123"},
+            "collection": {"href": "/rest/v1/candidates"}
+        });
+        let resp = fmt
+            .format_single_with_links(&result, &empty_headers(), links)
+            .unwrap();
+        let body = resp.body.unwrap();
+        assert!(body.get("_links").is_some());
+        assert_eq!(body["_links"]["self"]["href"], "/rest/v1/candidates/abc-123");
+        assert!(body.get("data").is_some());
+    }
+
+    #[test]
+    fn format_single_with_links_preserves_etag() {
+        let config = default_config();
+        let fmt = RestResponseFormatter::new(&config, "/rest/v1");
+        let result = v(r#"{"data":{"id":"abc-123"}}"#);
+        let links = json!({"self": {"href": "/rest/v1/test/abc-123"}});
+        let resp = fmt
+            .format_single_with_links(&result, &empty_headers(), links)
+            .unwrap();
+        assert!(resp.headers.get("etag").is_some());
+    }
+
+    #[test]
+    fn format_single_with_links_304_when_etag_matches() {
+        let config = default_config();
+        let fmt = RestResponseFormatter::new(&config, "/rest/v1");
+        let result = v(r#"{"data":{"id":"abc-123"}}"#);
+        let links = json!({"self": {"href": "/rest/v1/test/abc-123"}});
+        let resp1 = fmt
+            .format_single_with_links(&result, &empty_headers(), links.clone())
+            .unwrap();
+        let etag = resp1
+            .headers
+            .get("etag")
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+        let resp2 = fmt
+            .format_single_with_links(&result, &headers_with_if_none_match(&etag), links)
+            .unwrap();
+        assert_eq!(resp2.status, StatusCode::NOT_MODIFIED);
     }
 }
